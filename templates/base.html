@@ -435,6 +435,43 @@
 
                 <div class="sidebar-divider"></div>
 
+                <!-- API DATA: khusus superadmin -->
+                {% if request.user.profile.role == 'superadmin' %}
+                <div class="sidebar-section-label">API Data</div>
+
+                <div>
+                    <button type="button" id="btnApiData"
+                        onclick="toggleSidebar('apiDataDropdown','btnApiData')"
+                        class="sidebar-link {% if current == 'api_kecelakaan_preprosesing_page' or current == 'api_ahc_preprosesing_page' or current == 'api_kmeans_preprosesing_page' %}active dropdown-open{% endif %}">
+                        <i class="fas fa-server icon-left"></i>
+                        <span>API Data</span>
+                        <i class="fas fa-chevron-down sidebar-chevron"></i>
+                    </button>
+
+                    <div id="apiDataDropdown" class="sidebar-dropdown {% if current == 'api_kecelakaan_preprosesing_page' or current == 'api_ahc_preprosesing_page' or current == 'api_kmeans_preprosesing_page' %}open{% endif %}">
+                        <div class="sidebar-dropdown-inner">
+                            <a class="sidebar-link {% if current == 'api_kecelakaan_preprosesing_page' %}active{% endif %}"
+                                href="{% url 'api_kecelakaan_preprosesing_page' %}">
+                                <i class="fas fa-car-crash icon-left"></i>
+                                <span>Z-Score API</span>
+                            </a>
+                            <a class="sidebar-link {% if current == 'api_ahc_preprosesing_page' %}active{% endif %}"
+                                href="{% url 'api_ahc_preprosesing_page' %}">
+                                <i class="fas fa-project-diagram icon-left"></i>
+                                <span>AHC API</span>
+                            </a>
+                            <a class="sidebar-link {% if current == 'api_kmeans_preprosesing_page' %}active{% endif %}"
+                                href="{% url 'api_kmeans_preprosesing_page' %}">
+                                <i class="fas fa-chart-pie icon-left"></i>
+                                <span>Kmeans API</span>
+                            </a>
+                        </div>
+                    </div>
+                </div>
+                {% endif %}
+
+                <div class="sidebar-divider"></div>
+
                 <!-- DATA PEMETAAN -->
                 <div class="sidebar-section-label">Data Pemetaan</div>
 

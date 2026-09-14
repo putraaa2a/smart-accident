@@ -121,7 +121,13 @@ urlpatterns = [
 
 
     # API
+    path('api-data/kecelakaan/', views.api_data_page, {'api_name': 'kecelakaan'}, name='api_kecelakaan_preprosesing_page'),
+    path('api-data/ahc/', views.api_data_page, {'api_name': 'ahc'}, name='api_ahc_preprosesing_page'),
+    path('api-data/kmeans/', views.api_data_page, {'api_name': 'kmeans'}, name='api_kmeans_preprosesing_page'),
+    path('api/kecelakaan-preprosesing/', views.api_kecelakaan_preprosesing, name='api_kecelakaan_preprosesing'),
     path('api/segmen/geojson/', views.api_segmen_geojson, name='api_segmen_geojson'),
+    path('api/ahc-preprosesing/', views.api_ahc_preprosesing, name='api_ahc_preprosesing'),
+    path('api/kmeans-preprosesing/', views.api_kmeans_preprosesing, name='api_kmeans_preprosesing'),
     path('api/segmen/thresholds/', views.api_threshold_data, name='api_threshold_data'),
     path('api/segmen/check-update/', views.api_data_update_check, name='api_data_update_check'),
     path('api/kecelakaan/geojson/', views.api_kecelakaan_geojson, name='api_kecelakaan_geojson'),

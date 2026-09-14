@@ -11,7 +11,7 @@ from django.utils import timezone
 from django.contrib.auth.decorators import login_required
 from django.contrib import messages
 from django.core.paginator import Paginator
-from .models import AIConfig, ClusterData
+from .models import AIConfig, AhcPreprosesing
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics import silhouette_score
@@ -24,12 +24,55 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.figure_factory import create_dendrogram
 
+
+def _save_uploaded_ahc_data(df):
+    """Simpan baris file upload AHC ke tabel khusus sebelum transformasi."""
+    from decimal import Decimal, InvalidOperation
+    from .models import AhcPreprosesing
+
+    # Normalisasi nama kolom file agar sesuai dengan field tabel.
+    normalized = {str(column).strip().lower(): column for column in df.columns}
+
+    def value(row, name, default=''):
+        source = normalized.get(name.lower())
+        result = row[source] if source is not None else default
+        return default if pd.isna(result) else result
+
+    def to_date(raw_value):
+        parsed = pd.to_datetime(raw_value, errors='coerce')
+        return None if pd.isna(parsed) else parsed.date()
+
+    def to_decimal(raw_value):
+        try:
+            digits = re.sub(r'[^0-9.-]', '', str(raw_value))
+            return Decimal(digits or '0')
+        except (InvalidOperation, ValueError):
+            return Decimal('0')
+
+    records = []
+    for _, row in df.iterrows():
+        age = pd.to_numeric(value(row, 'umur', 0), errors='coerce')
+        records.append(AhcPreprosesing(
+            no_referensi=str(value(row, 'no')).strip() or None,
+            umur=0 if pd.isna(age) else int(age),
+            tkp=str(value(row, 'tkp')).strip(),
+            penyebab=str(value(row, 'penyebab')).strip(),
+            hari=str(value(row, 'hari')).strip(),
+            tanggal=to_date(value(row, 'tanggal', None)),
+            jam=str(value(row, 'jam')).strip(),
+            jenis_kendaraan=str(value(row, 'jenis kendaraan')).strip(),
+            tipe_kendaraan=str(value(row, 'tipe kendaraan')).strip(),
+            kerugian_material=to_decimal(value(row, 'kerugian material', 0)),
+        ))
+    if records:
+        AhcPreprosesing.objects.bulk_create(records, batch_size=1000)
+
 # ================================
 # HALAMAN DATA
 # ================================
 @login_required(login_url='login')
 def ahc_data(request):
-    all_data = ClusterData.objects.all().order_by('-tanggal', '-jam')
+    all_data = AhcPreprosesing.objects.all().order_by('-tanggal', '-jam')
     total_count = all_data.count()
     
     # Paginasi 20 item per halaman
@@ -49,15 +92,15 @@ def ahc_data(request):
 @login_required(login_url='login')
 def ahc_proses(request):
     context = {}
-    summary_df = request.session.get('summary_df')
-    jumlah_data_asli = request.session.get('jumlah_data_asli')
-    hasil_cluster = request.session.get('hasil_cluster')
-    summary_cluster = request.session.get('summary_cluster')
-    jumlah_cluster = request.session.get('jumlah_cluster')
+    summary_df = request.session.get('ahc_summary_df')
+    jumlah_data_asli = request.session.get('ahc_jumlah_data_asli')
+    hasil_cluster = request.session.get('ahc_hasil_cluster')
+    summary_cluster = request.session.get('ahc_summary_cluster')
+    jumlah_cluster = request.session.get('ahc_jumlah_cluster')
 
     if summary_df:
         context['preview'] = summary_df
-        context['jumlah_data'] = request.session.get('jumlah_data', len(summary_df))
+        context['jumlah_data'] = request.session.get('ahc_jumlah_data', len(summary_df))
         context['jumlah_data_asli'] = jumlah_data_asli
 
     if hasil_cluster:
@@ -78,19 +121,18 @@ def preprocessing_data(request):
     if request.method == "POST" or use_db:
         
         keys_to_clear = [
-            'hasil_cluster', 'summary_cluster', 'jumlah_cluster', 'jumlah_data', 
-            'silhouette_score', 'X_scaled', 'summary_df', 'jumlah_data_asli', 
+            'ahc_hasil_cluster', 'ahc_summary_cluster', 'ahc_jumlah_cluster', 'ahc_jumlah_data', 
+            'ahc_silhouette_score', 'ahc_X_scaled', 'ahc_summary_df', 'ahc_jumlah_data_asli', 
             'ai_explain_cache', 'ahc_ai_rekomendasi', 'ai_context_data',
             'ai_pca', 'ai_dendrogram', 'ai_bar', 'ai_faktor', 'ai_umur',
-            'uploaded_file_name'
+            'ahc_uploaded_file_name'
         ]
         for key in keys_to_clear:
             request.session.pop(key, None)
 
         df = None
         if use_db:
-            from .models import ClusterData
-            data_db = ClusterData.objects.all().values()
+            data_db = AhcPreprosesing.objects.all().values()
             if not data_db:
                 messages.error(request, "Data di database masih kosong.")
                 return redirect('ahc_proses')
@@ -102,12 +144,13 @@ def preprocessing_data(request):
                 'jenis_kendaraan': 'Jenis Kendaraan', 'tipe_kendaraan': 'Tipe Kendaraan',
                 'kerugian_material': 'Kerugian Material'
             })
-            request.session['uploaded_file_name'] = "Database"
+            request.session['ahc_uploaded_file_name'] = "Database AHC"
         else:
             file = request.FILES.get('file')
             if file:
-                request.session['uploaded_file_name'] = file.name
+                request.session['ahc_uploaded_file_name'] = file.name
                 df = pd.read_excel(file)
+                _save_uploaded_ahc_data(df)
 
         if df is not None:
             df.columns = [str(c).strip() for c in df.columns]
@@ -117,7 +160,7 @@ def preprocessing_data(request):
                     df[col] = df[col].apply(lambda x: " ".join(str(x).split()) if pd.notnull(x) else "")
                     df[col] = df[col].str.title()
 
-            request.session['jumlah_data_asli'] = len(df)
+            request.session['ahc_jumlah_data_asli'] = len(df)
             df.replace(['-', 'Nan', 'nan'], np.nan, inplace=True)
 
             if 'Umur' in df.columns:
@@ -183,10 +226,10 @@ def preprocessing_data(request):
             X_scaled = scaler.fit_transform(fitur_clustering)
 
             # Simpan ke session - Gunakan to_json lalu loads agar aman dari tipe data Timestamp/Numpy
-            request.session['summary_df'] = json.loads(df.head(100).to_json(orient='records'))
-            request.session['X_scaled'] = X_scaled.tolist()
-            request.session['jumlah_data'] = len(df)
-            request.session['full_features'] = json.loads(fitur_clustering.to_json(orient='records'))
+            request.session['ahc_summary_df'] = json.loads(df.head(100).to_json(orient='records'))
+            request.session['ahc_X_scaled'] = X_scaled.tolist()
+            request.session['ahc_jumlah_data'] = len(df)
+            request.session['ahc_full_features'] = json.loads(fitur_clustering.to_json(orient='records'))
             request.session.modified = True
             return redirect('ahc_proses')
     return render(request, 'coreapp/ahc/proses.html', context)
@@ -208,7 +251,7 @@ def find_best_cluster(X, max_k=5):
 # ================================
 @login_required(login_url='login')
 def proses_ahc(request):
-    X_scaled, full_features = request.session.get('X_scaled'), request.session.get('full_features')
+    X_scaled, full_features = request.session.get('ahc_X_scaled'), request.session.get('ahc_full_features')
     if not X_scaled or not full_features: return render(request, 'coreapp/ahc/proses.html', 
                                                         {"error": "Silakan lakukan preprocessing terlebih dahulu."})
 
@@ -267,13 +310,13 @@ def proses_ahc(request):
     # Pastikan data serializable
     hasil_cluster_serializable = json.loads(df.to_json(orient='records'))
     request.session.update({
-        'hasil_cluster': hasil_cluster_serializable, 
-        'summary_cluster': summary, 
-        'jumlah_cluster': n_cluster, 
-        'silhouette_score': sil_score, 
-        'dendrogram_html': dendrogram_html, 
-        'scatter_html': scatter_html, 
-        'boxplot_html': boxplot_html
+        'ahc_hasil_cluster': hasil_cluster_serializable, 
+        'ahc_summary_cluster': summary, 
+        'ahc_jumlah_cluster': n_cluster, 
+        'ahc_silhouette_score': sil_score, 
+        'ahc_dendrogram_html': dendrogram_html, 
+        'ahc_scatter_html': scatter_html, 
+        'ahc_boxplot_html': boxplot_html
     })
     
     # Bersihkan cache AI lama & Fallback lama karena data sudah berubah total
@@ -295,11 +338,11 @@ def proses_ahc(request):
 @login_required(login_url='login')
 @never_cache
 def ahc_hasil(request):
-    hasil_cluster = request.session.get('hasil_cluster', [])
+    hasil_cluster = request.session.get('ahc_hasil_cluster', [])
     df = pd.DataFrame(hasil_cluster)
-    summary_cluster = request.session.get('summary_cluster', [])
-    jumlah_cluster, jumlah_data, silhouette = request.session.get('jumlah_cluster'), request.session.get('jumlah_data'), request.session.get('silhouette_score')
-    scatter_html, dendrogram_html, boxplot_html = request.session.get('scatter_html'), request.session.get('dendrogram_html'), request.session.get('boxplot_html')
+    summary_cluster = request.session.get('ahc_summary_cluster', [])
+    jumlah_cluster, jumlah_data, silhouette = request.session.get('ahc_jumlah_cluster'), request.session.get('ahc_jumlah_data'), request.session.get('ahc_silhouette_score')
+    scatter_html, dendrogram_html, boxplot_html = request.session.get('ahc_scatter_html'), request.session.get('ahc_dendrogram_html'), request.session.get('ahc_boxplot_html')
 
     if not summary_cluster: return render(request, 'coreapp/ahc/hasil.html', {"belum_clustering": True})
     ai_global = generate_ai_insight(summary_cluster, silhouette)
@@ -352,7 +395,7 @@ def ahc_hasil(request):
     # ==========================================
 
     # 1. Analisis PCA (Dynamic Position & Density)
-    X_scaled = request.session.get('X_scaled')
+    X_scaled = request.session.get('ahc_X_scaled')
     ai_pca = ""
     if X_scaled:
         X_scaled_arr = np.array(X_scaled)
@@ -449,13 +492,13 @@ def ahc_hasil(request):
     """
 
     # Simpan analisis standar ke session sebagai cadangan (fallback)
-    request.session['ai_pca'] = ai_pca
-    request.session['ai_dendrogram'] = ai_dendrogram
-    request.session['ai_boxplot'] = ai_boxplot
-    request.session['ai_faktor'] = ai_faktor
-    request.session['ai_umur'] = ai_umur
+    request.session['ahc_ai_pca'] = ai_pca
+    request.session['ahc_ai_dendrogram'] = ai_dendrogram
+    request.session['ahc_ai_boxplot'] = ai_boxplot
+    request.session['ahc_ai_faktor'] = ai_faktor
+    request.session['ahc_ai_umur'] = ai_umur
 
-    request.session['ai_context_data'] = {
+    request.session['ahc_ai_context_data'] = {
         "max_faktor": faktor_labels[max_idx],
         "max_faktor_pct": pct_max,
         "max_umur_label": max_u_label,
@@ -469,13 +512,13 @@ def ahc_hasil(request):
     return render(request, 'coreapp/ahc/hasil.html', {
         "hasil_cluster": hasil_cluster, "summary_cluster": summary_cluster, "jumlah_cluster": jumlah_cluster, 
         "jumlah_data": jumlah_data, "total_kejadian": jumlah_data, "silhouette_score": silhouette,
-        "scatter_html": scatter_html, "dendrogram_html": dendrogram_html, "boxplot_html": boxplot_html, 
+        "ahc_scatter_html": scatter_html, "ahc_dendrogram_html": dendrogram_html, "ahc_boxplot_html": boxplot_html, 
         "faktor_labels": faktor_labels, "faktor_values": faktor_values, "umur_labels": umur_labels,
         "cluster_labels": cluster_labels, "cluster_counts": cluster_counts, "cluster_detail": cluster_detail,
         "faktor_kelalaian": f_kelalaian, "faktor_pelanggaran": f_pelanggaran, "faktor_teknis": f_teknis, 
         "ai_faktor": ai_faktor, "ai_umur": ai_umur, "ai_global": ai_global,
         "ai_boxplot": ai_boxplot, "ai_pca": ai_pca, "ai_dendrogram": ai_dendrogram,
-        "ai_explain_cache": request.session.get('ai_explain_cache')
+        "ahc_ai_explain_cache": request.session.get('ahc_ai_explain_cache')
     })
 
 # ================================
@@ -484,10 +527,12 @@ def ahc_hasil(request):
 @login_required(login_url='login')
 def reset_ahc(request):
     keys_to_clear = [
-        'hasil_cluster', 'summary_cluster', 'jumlah_cluster', 'jumlah_data', 
-        'silhouette_score', 'X_scaled', 'summary_df', 'ai_explain_cache', 
-        'ahc_ai_rekomendasi', 'ai_context_data', 'uploaded_file_name',
-        'ai_pca', 'ai_dendrogram', 'ai_boxplot', 'ai_faktor', 'ai_umur', 'jumlah_data_asli'
+        'ahc_hasil_cluster', 'ahc_summary_cluster', 'ahc_jumlah_cluster', 'ahc_jumlah_data',
+        'ahc_silhouette_score', 'ahc_X_scaled', 'ahc_summary_df', 'ahc_full_features',
+        'ahc_ai_explain_cache', 'ahc_ai_rekomendasi', 'ahc_ai_context_data',
+        'ahc_uploaded_file_name', 'ahc_ai_pca', 'ahc_ai_dendrogram', 'ahc_ai_boxplot',
+        'ahc_ai_faktor', 'ahc_ai_umur', 'ahc_jumlah_data_asli', 'ahc_scatter_html',
+        'ahc_dendrogram_html', 'ahc_boxplot_html'
     ]
     for k in keys_to_clear:
         request.session.pop(k, None)
@@ -559,16 +604,16 @@ def generate_ai_insight(summary_cluster, silhouette):
 def ahc_ai_explain(request):
     # 1. Cek Cache (Pola Final YOLA)
     force = request.POST.get('force') == '1'
-    cached = request.session.get('ai_explain_cache')
+    cached = request.session.get('ahc_ai_explain_cache')
     
     if cached and not force:
         return JsonResponse({"status": "ok", "data": cached, "source": "cache"})
 
     # 2. Ambil Data
-    hasil_cluster = request.session.get('hasil_cluster')
-    summary_cluster = request.session.get('summary_cluster')
-    silhouette = request.session.get('silhouette_score')
-    X_scaled = request.session.get('X_scaled')
+    hasil_cluster = request.session.get('ahc_hasil_cluster')
+    summary_cluster = request.session.get('ahc_summary_cluster')
+    silhouette = request.session.get('ahc_silhouette_score')
+    X_scaled = request.session.get('ahc_X_scaled')
 
     if not hasil_cluster or not summary_cluster or X_scaled is None:
         return JsonResponse({"status": "error", "message": "Data clustering belum tersedia."}, status=400)
@@ -855,7 +900,7 @@ def ahc_ai_explain(request):
                 
             parsed = json.loads(raw_text)
             
-            request.session['ai_explain_cache'] = parsed
+            request.session['ahc_ai_explain_cache'] = parsed
             request.session.modified = True
             request.session.save()
             
@@ -885,7 +930,7 @@ def ahc_rekomendasi(request):
     Jika method POST (AJAX), maka generate rekomendasi baru via AI.
     """
     # 1. Cek Data Clustering di Session
-    summary_cluster = request.session.get("summary_cluster")
+    summary_cluster = request.session.get("ahc_summary_cluster")
     if not summary_cluster:
         return render(request, "coreapp/ahc/rekomendasi.html", {"belum_clustering": True})
 
@@ -896,9 +941,9 @@ def ahc_rekomendasi(request):
     if request.method == "POST" and request.headers.get("x-requested-with") == "XMLHttpRequest":
         try:
             # Siapkan Payload untuk AI
-            silhouette = request.session.get("silhouette_score")
-            jumlah_data = request.session.get("jumlah_data")
-            ai_context = request.session.get("ai_context_data", {})
+            silhouette = request.session.get("ahc_silhouette_score")
+            jumlah_data = request.session.get("ahc_jumlah_data")
+            ai_context = request.session.get("ahc_ai_context_data", {})
             
             payload = {
                 "summary": summary_cluster,

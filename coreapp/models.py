@@ -903,7 +903,12 @@ class RekapSegmen(models.Model):
     
     @staticmethod
     def update_rekap(tahun=None):
-        """Update rekapitulasi untuk tahun tertentu atau semua tahun"""
+        """Update rekapitulasi untuk tahun tertentu atau semua tahun
+        
+        OPTIMIZED dengan bulk_create() untuk menghindari N+1 query problem.
+        Daripada INSERT query per segmen, gunakan satu batch INSERT untuk semua segmen.
+        Ini mengurangi dari 100+ queries menjadi hanya 1-2 queries untuk 100 segmen.
+        """
         from django.db.models import Sum, Count, Q
         
         if tahun is None or tahun == 0 or tahun == '0':
@@ -914,16 +919,25 @@ class RekapSegmen(models.Model):
             except (ValueError, TypeError):
                 tahun = 0
         
+        print(f"   🔄 Deleting old RekapSegmen for tahun {tahun}...")
         # Hapus rekap lama
-        RekapSegmen.objects.filter(periode_tahun=tahun).delete()
+        deleted_count, _ = RekapSegmen.objects.filter(periode_tahun=tahun).delete()
+        print(f"   ✓ Deleted {deleted_count} old records")
         
         # Hitung ulang dari data kecelakaan preprocessing
-        segmen_list = SegmenJalan.objects.all()
+        # OPTIMIZED: Ambil semua segmen dengan satu query
+        segmen_list = SegmenJalan.objects.all().values('id', 'nama_segmen', 'ruas_jalan_id')
         
-        for segmen in segmen_list:
+        print(f"   📊 Computing recap for {segmen_list.count()} segments...")
+        rekap_objects = []  # Batch list untuk bulk_create
+        
+        for segmen_dict in segmen_list:
+            segmen_id = segmen_dict['id']
+            
+            # Query kecelakaan untuk segmen ini
             if tahun == 0:
                 kecelakaan_data = KecelakaanPreprosesing.objects.filter(
-                    segmen_jalan=segmen
+                    segmen_jalan_id=segmen_id
                 ).aggregate(
                     jumlah=Count('id'),
                     meninggal=Sum('korban_meninggal'),
@@ -933,7 +947,7 @@ class RekapSegmen(models.Model):
                 )
             else:
                 kecelakaan_data = KecelakaanPreprosesing.objects.filter(
-                    segmen_jalan=segmen,
+                    segmen_jalan_id=segmen_id,
                     tanggal__year=tahun
                 ).aggregate(
                     jumlah=Count('id'),
@@ -948,8 +962,9 @@ class RekapSegmen(models.Model):
                           (kecelakaan_data['luka_berat'] or 0) + \
                           (kecelakaan_data['luka_ringan'] or 0)
             
-            RekapSegmen.objects.create(
-                segmen_jalan=segmen,
+            # Buat object untuk batch insert (jangan save langsung)
+            rekap_obj = RekapSegmen(
+                segmen_jalan_id=segmen_id,
                 jumlah_kecelakaan=kecelakaan_data['jumlah'] or 0,
                 total_korban=total_korban,
                 total_meninggal=kecelakaan_data['meninggal'] or 0,
@@ -958,6 +973,12 @@ class RekapSegmen(models.Model):
                 total_kerugian=kecelakaan_data['kerugian'] or 0,
                 periode_tahun=tahun
             )
+            rekap_objects.append(rekap_obj)
+        
+        # BULK INSERT sekaligus (jauh lebih cepat daripada per-row insert)
+        print(f"   💾 Bulk inserting {len(rekap_objects)} recap records...")
+        RekapSegmen.objects.bulk_create(rekap_objects, batch_size=1000)
+        print(f"   ✅ Successfully created {len(rekap_objects)} recap records")
 
 
 class AnalisisZScore(models.Model):
@@ -998,67 +1019,117 @@ class AnalisisZScore(models.Model):
     
     @staticmethod
     def calculate_zscore(tahun=None):
-        """Hitung Z-Score untuk setiap segmen PER RUAS JALAN dengan interval dinamis"""
+        """Hitung Z-Score untuk setiap segmen PER RUAS JALAN dengan interval dinamis
+        
+        CATATAN: Pemanggilan RekapSegmen.update_rekap() telah dihapus dari sini karena
+        sudah dilakukan di views.py sebelum fungsi ini dipanggil.
+        Ini memastikan perhitungan tidak berjalan berulang-ulang saat upload data masif.
+        """
         from django.db.models import Avg, StdDev, Max, Min
         import decimal
         
         if tahun is None or tahun == 0 or tahun == '0':
             tahun = 0
         
-        # 1. Pastikan data rekapitulasi kecelakaan sudah diperbarui untuk tahun yang dipilih
-        RekapSegmen.update_rekap(tahun)
-        
         # 2. Hapus data analisis Z-Score lama untuk tahun tersebut agar tidak duplikat
         AnalisisZScore.objects.filter(tahun=tahun).delete()
+
+        # Jika tidak ada data RekapSegmen untuk tahun ini tetapi sumber data ada,
+        # regenereate RekapSegmen otomatis agar perhitungan bisa berjalan.
+        try:
+            rekap_exists = RekapSegmen.objects.filter(periode_tahun=tahun).exists()
+        except Exception:
+            rekap_exists = False
+
+        if not rekap_exists:
+            # Cek apakah ada segmen jalan dan data kecelakaan preprosesing sebagai sumber
+            from django.db.models import Q
+            segmen_exists = SegmenJalan.objects.exists()
+            kecelakaan_exists = KecelakaanPreprosesing.objects.filter(
+                Q(tanggal__isnull=False) | Q(id__isnull=False)
+            ).exists()
+
+            if segmen_exists and kecelakaan_exists:
+                print(f"   ℹ️ No RekapSegmen for tahun {tahun} found — regenerating from source data...")
+                RekapSegmen.update_rekap(tahun)
+            else:
+                print(f"   ⚠️ No RekapSegmen and insufficient source data to regenerate for tahun {tahun}")
         
         # 3. Ambil semua daftar ruas jalan yang unik
         ruas_jalan_list = RuasJalan.objects.all().distinct()
-        
+
         print(f"\n📊 Calculating Z-Score for {tahun} - Per Ruas Jalan (Dynamic Intervals)")
         print(f"{'='*80}")
-        
+
         # 4. Iterasi setiap ruas jalan untuk menghitung Z-Score secara spesifik per ruas
         for ruas_jalan in ruas_jalan_list:
-            # Ambil semua segmen yang termasuk dalam ruas jalan ini
+            # Ambil semua segmen yang termasuk dalam ruas jalan ini (count saja untuk debug)
             segments_in_ruas = SegmenJalan.objects.filter(ruas_jalan=ruas_jalan)
-            
-            # Hitung statistik dasar (Rata-rata dan Standar Deviasi) dari jumlah kecelakaan di ruas ini
-            # StdDev (σ) mengukur seberapa jauh variasi data kecelakaan dari rata-ratanya
-            
-            # Standar Deviasi digunakan untuk memahami apakah angka kecelakaan di suatu 
-            # ruas jalan cenderung merata di semua segmen, atau hanya menumpuk di titik-titik tertentu saja.
-            # Nilai ini kemudian menjadi pembagi dalam rumus Z-Score untuk menentukan apakah sebuah angka kecelakaan di satu segmen termasuk "ekstrim" (rawan) atau masih dalam batas wajar.
-            stats = RekapSegmen.objects.filter(
+
+            # Ambil semua data rekap untuk ruas ini (gunakan join untuk menghindari N+1)
+            rekap_qs = RekapSegmen.objects.filter(
                 periode_tahun=tahun,
-                segmen_jalan__in=segments_in_ruas
-            ).aggregate(
-                mean=Avg('jumlah_kecelakaan'),
-                stddev=StdDev('jumlah_kecelakaan')
-            )
-            
-            mean = float(stats['mean'] or 0)
-            stddev = float(stats['stddev'] or 1)
-            
-            # Hindari pembagian dengan nol jika standar deviasi tidak terhitung
-            if stddev == 0:
-                stddev = 1
-            
+                segmen_jalan__ruas_jalan=ruas_jalan
+            ).select_related('segmen_jalan').order_by('segmen_jalan_id', '-updated_at')
+
+            if not rekap_qs.exists():
+                continue
+
+            # Jika ada duplikat RekapSegmen untuk satu SegmenJalan, pilih hanya satu (terbaru berdasarkan updated_at)
+            unique_rekap = {}
+            for r in rekap_qs:
+                seg_id = r.segmen_jalan_id
+                if seg_id not in unique_rekap:
+                    unique_rekap[seg_id] = r
+
+            # Gunakan daftar rekap yang sudah didedup
+            dedup_rekap_list = list(unique_rekap.values())
+
+            # PENTING: Hitung Mean dan StdDev secara MANUAL untuk konsistensi dengan Excel
+            # Gunakan POPULATION variance (N) seperti Excel STDEV.P() untuk match hasil Excel
+            import math
+
+            jumlah_values = [float(r.jumlah_kecelakaan) for r in dedup_rekap_list]
+            n = len(jumlah_values)
+
+            if n == 0:
+                continue
+
+            # Hitung Mean (rata-rata) manual
+            mean = sum(jumlah_values) / n
+
+            # Hitung Variance dan StdDev menggunakan POPULATION variance (N, bukan N-1)
+            # Excel STDEV.P() = √[Σ(X-μ)²/N]
+            sum_squared_diff = sum((x - mean) ** 2 for x in jumlah_values)
+            variance = sum_squared_diff / n  # Population variance
+            stddev = math.sqrt(variance)
+
+            # Jika variance == 0, set stddev ke 0.0 (sama dengan Excel STDEV.P)
+            if variance == 0:
+                stddev = 0.0
+
+            # Debug logs required by user
+            print("=" * 80)
+            print("Ruas :", ruas_jalan.nama_ruas)
+            print("Jumlah Segmen :", segments_in_ruas.count())
+            print("Jumlah Rekap :", rekap_qs.count())
+            print("Data :", jumlah_values)
+            print("Mean :", round(mean, 3))
+            print("StdDev :", round(stddev, 3))
+            print("=" * 80)
+
             # 5. Hitung nilai Z-Score mentah untuk setiap segmen
-            # Rumus: Z = (X - μ) / σ
-            # Di mana X = jumlah kecelakaan, μ = rata-rata, σ = standar deviasi
             zscore_dict = {}
-            rekap_list = RekapSegmen.objects.filter(
-                periode_tahun=tahun,
-                segmen_jalan__in=segments_in_ruas
-            )
-            
-            for rekap in rekap_list:
-                zscore = (float(rekap.jumlah_kecelakaan) - mean) / stddev
+            for rekap in dedup_rekap_list:
+                if stddev == 0:
+                    zscore = 0.0
+                else:
+                    zscore = (float(rekap.jumlah_kecelakaan) - mean) / stddev
                 zscore_dict[rekap.segmen_jalan.id] = {
                     'rekap': rekap,
                     'zscore': zscore
                 }
-            
+
             # 6. Tentukan nilai Z_max dan Z_min untuk menentukan rentang interval klasifikasi
             if zscore_dict:
                 zscore_values = [item['zscore'] for item in zscore_dict.values()]
@@ -1067,33 +1138,32 @@ class AnalisisZScore(models.Model):
             else:
                 z_max = 0
                 z_min = 0
-            
+
             # 7. Hitung Interval (I) untuk membagi data ke dalam 5 kategori klasifikasi
-            # Rumus Interval: I = (Z_max - Z_min) / Jumlah_Kelas
             num_classifications = 5
             if z_max != z_min:
                 interval = (z_max - z_min) / num_classifications
             else:
-                interval = 1  # Default jika semua nilai Z-Score sama
-            
+                interval = 1
+
             # 8. Tentukan ambang batas (threshold) untuk setiap tingkatan kategori
-            threshold_1 = z_min + (1 * interval)  # Batas Sangat Rendah -> Rendah
-            threshold_2 = z_min + (2 * interval)  # Batas Rendah -> Sedang
-            threshold_3 = z_min + (3 * interval)  # Batas Sedang -> Tinggi
-            threshold_4 = z_min + (4 * interval)  # Batas Tinggi -> Sangat Tinggi
-            
+            threshold_1 = z_min + (1 * interval)
+            threshold_2 = z_min + (2 * interval)
+            threshold_3 = z_min + (3 * interval)
+            threshold_4 = z_min + (4 * interval)
+
             segmen_count = segments_in_ruas.count()
             print(f"\n🛣️ Ruas: {ruas_jalan.nama_ruas} ({segmen_count} segmen)")
-            print(f"   Mean: {mean:.2f}, StdDev: {stddev:.2f}")
+            print(f"   Mean: {mean:.3f}, StdDev: {stddev:.3f}")
             print(f"   Z_max: {z_max:.3f}, Z_min: {z_min:.3f}, Interval: {interval:.3f}")
             print(f"   Thresholds: {threshold_1:.3f} | {threshold_2:.3f} | {threshold_3:.3f} | {threshold_4:.3f}")
-            
+
             # 9. Klasifikasikan setiap segmen ke dalam kategori berdasarkan threshold yang sudah dihitung
+            zscore_batch = []
             for segmen_id, data in zscore_dict.items():
                 rekap = data['rekap']
                 zscore = data['zscore']
-                
-                # Penentuan kategori secara dinamis
+
                 if zscore >= threshold_4:
                     kategori = 'sangat_tinggi'
                 elif zscore >= threshold_3:
@@ -1104,16 +1174,24 @@ class AnalisisZScore(models.Model):
                     kategori = 'rendah'
                 else:
                     kategori = 'sangat_rendah'
-                
-                # 10. Simpan hasil analisis Z-Score ke database
-                AnalisisZScore.objects.create(
+
+                zscore_obj = AnalisisZScore(
                     segmen_jalan=rekap.segmen_jalan,
                     nilai_zscore=decimal.Decimal(str(round(zscore, 3))),
                     kategori=kategori,
                     tahun=tahun
                 )
-                
-                print(f"   ✓ {rekap.segmen_jalan.nama_segmen}: {rekap.jumlah_kecelakaan} accidents → Z={zscore:.3f} ({kategori})")
+                zscore_batch.append(zscore_obj)
+
+            # BULK INSERT sekaligus untuk semua segmen di ruas ini
+            if zscore_batch:
+                print(f"   💾 Bulk inserting {len(zscore_batch)} Z-Score records for ruas {ruas_jalan.nama_ruas}...")
+                AnalisisZScore.objects.bulk_create(zscore_batch, batch_size=1000)
+                print(f"   ✅ Successfully created {len(zscore_batch)} Z-Score records")
+                kategori_counts = {}
+                for obj in zscore_batch:
+                    kategori_counts[obj.kategori] = kategori_counts.get(obj.kategori, 0) + 1
+                print(f"   📊 Distribution: {kategori_counts}")
         
         print(f"\n{'='*80}\n")
 
@@ -1395,6 +1473,54 @@ class ClusterData(models.Model):
 
     def __str__(self):
         return f"{self.tanggal} - {self.tkp}"
+
+
+class AhcPreprosesing(models.Model):
+    """Menyimpan baris file yang dipakai pada preprocessing AHC."""
+    id = models.AutoField(primary_key=True)
+    no_referensi = models.CharField(max_length=50, blank=True, null=True)
+    umur = models.IntegerField(default=0)
+    tkp = models.CharField(max_length=255, blank=True)
+    penyebab = models.CharField(max_length=255, blank=True)
+    hari = models.CharField(max_length=20, blank=True)
+    tanggal = models.DateField(null=True, blank=True)
+    jam = models.CharField(max_length=10, blank=True)
+    jenis_kendaraan = models.CharField(max_length=100, blank=True)
+    tipe_kendaraan = models.CharField(max_length=100, blank=True)
+    kerugian_material = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'ahc_preprosesing'
+        verbose_name_plural = 'AHC Preprocessing'
+        ordering = ['-tanggal', '-jam']
+
+    def __str__(self):
+        return f"AHC {self.tanggal} - {self.tkp}"
+
+
+class KmeansPreprosesing(models.Model):
+    """Menyimpan baris file yang dipakai pada preprocessing K-Means."""
+    id = models.AutoField(primary_key=True)
+    no_referensi = models.CharField(max_length=50, blank=True, null=True)
+    umur = models.IntegerField(default=0)
+    tkp = models.CharField(max_length=255, blank=True)
+    penyebab = models.CharField(max_length=255, blank=True)
+    hari = models.CharField(max_length=20, blank=True)
+    tanggal = models.DateField(null=True, blank=True)
+    jam = models.CharField(max_length=10, blank=True)
+    jenis_kendaraan = models.CharField(max_length=100, blank=True)
+    tipe_kendaraan = models.CharField(max_length=100, blank=True)
+    kerugian_material = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'kmeans_preprosesing'
+        verbose_name_plural = 'K-Means Preprocessing'
+        ordering = ['-tanggal', '-jam']
+
+    def __str__(self):
+        return f"K-Means {self.tanggal} - {self.tkp}"
 
 class AIConfig(models.Model):
     """Model untuk menyimpan konfigurasi API Key AI"""

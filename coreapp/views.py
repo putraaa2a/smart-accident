@@ -16,9 +16,15 @@ from rest_framework.response import Response
 from .models import (
     RuasJalan, SegmenJalan, Kecelakaan, AnalisisZScore, RekapSegmen,
     Kota, Kecamatan, Kelurahan, ClusterData, AIConfig, Profile, Polres, Polda,
-    KecelakaanRaw, KecelakaanPreprosesing, LakaMentah
+    KecelakaanRaw, KecelakaanPreprosesing, LakaMentah,
+    AhcPreprosesing, KmeansPreprosesing
 )
 from rest_framework import status
+from .serializers import (
+    KecelakaanPreprosesingSerializer,
+    AhcPreprosesingSerializer,
+    KmeansPreprosesingSerializer,
+)
 import json
 import math
 import numpy as np
@@ -841,12 +847,7 @@ def map_view(request):
 
     # Hitung Z-Score
     try:
-        if tahun == 0:
-            # 🔥 Hitung Z-Score dari SEMUA DATA
-            AnalisisZScore.calculate_zscore_all_years()
-        else:
-            if not AnalisisZScore.objects.filter(tahun=tahun).exists():
-                AnalisisZScore.calculate_zscore(tahun)
+        _ensure_zscore_for_tahun(tahun)
     except Exception as e:
         print(f"Warning: Z-Score calculation failed: {e}")
 
@@ -856,6 +857,33 @@ def map_view(request):
     }
 
     return render(request, 'coreapp/map/map.html', context)
+
+
+def _ensure_zscore_for_tahun(tahun):
+    """Pastikan AnalisisZScore untuk tahun tertentu ada, termasuk semua-tahun (0)."""
+    if tahun == 0:
+        if not AnalisisZScore.objects.filter(tahun=0).exists():
+            AnalisisZScore.calculate_zscore_all_years()
+        return
+
+    if not AnalisisZScore.objects.filter(tahun=tahun).exists():
+        AnalisisZScore.calculate_zscore(tahun)
+
+    # Jika masih ada segmen dengan kecelakaan tetapi belum memiliki z-score,
+    # regenerasi untuk menjaga konsistensi data.
+    segmen_ids_with_acc = set(
+        KecelakaanPreprosesing.objects.filter(
+            segmen_jalan__isnull=False,
+            tanggal__year=tahun
+        ).values_list('segmen_jalan_id', flat=True).distinct()
+    )
+    if segmen_ids_with_acc:
+        existing_ids = set(
+            AnalisisZScore.objects.filter(tahun=tahun, segmen_jalan_id__in=segmen_ids_with_acc)
+            .values_list('segmen_jalan_id', flat=True).distinct()
+        )
+        if segmen_ids_with_acc - existing_ids:
+            AnalisisZScore.calculate_zscore(tahun)
 
 
 def peta_user_view(request):
@@ -872,8 +900,7 @@ def peta_user_view(request):
     
     # Hitung Z-Score jika belum ada
     try:
-        if not AnalisisZScore.objects.filter(tahun=tahun).exists():
-            AnalisisZScore.calculate_zscore(tahun)
+        _ensure_zscore_for_tahun(tahun)
     except Exception as e:
         print(f"Warning: Could not calculate Z-Score for {tahun}: {e}")
     
@@ -902,12 +929,11 @@ def api_segmen_geojson(request):
     print(f"{'='*80}")
     
     # Ensure Z-Score calculation exists for this year
-    if not AnalisisZScore.objects.filter(tahun=tahun).exists():
-        try:
-            AnalisisZScore.calculate_zscore(tahun)
-            print(f"✓ Auto-calculated Z-Score for {tahun}")
-        except Exception as e:
-            print(f"⚠ Could not auto-calculate Z-Score: {e}")
+    try:
+        _ensure_zscore_for_tahun(tahun)
+        print(f"✓ Z-Score ensured for tahun={tahun}")
+    except Exception as e:
+        print(f"⚠ Could not ensure Z-Score for tahun={tahun}: {e}")
     
     segmen_list = SegmenJalan.objects.select_related('ruas_jalan').all()
     print(f"📊 Found {segmen_list.count()} segments in database")
@@ -943,7 +969,10 @@ def api_segmen_geojson(request):
             except AnalisisZScore.DoesNotExist:
                 # Ada kecelakaan tapi belum ada Z-Score → coba hitung
                 try:
-                    AnalisisZScore.calculate_zscore(tahun)
+                    if tahun == 0:
+                        AnalisisZScore.calculate_zscore_all_years()
+                    else:
+                        AnalisisZScore.calculate_zscore(tahun)
                     analisis = AnalisisZScore.objects.get(segmen_jalan=segmen, tahun=tahun)
                     kategori = analisis.kategori
                     zscore = float(analisis.nilai_zscore)
@@ -1189,11 +1218,10 @@ def api_threshold_data(request):
             tahun = 0
     
     # Ensure Z-Score calculation exists
-    if not AnalisisZScore.objects.filter(tahun=tahun).exists():
-        try:
-            AnalisisZScore.calculate_zscore(tahun)
-        except Exception as e:
-            print(f"Warning: Could not auto-calculate Z-Score: {e}")
+    try:
+        _ensure_zscore_for_tahun(tahun)
+    except Exception as e:
+        print(f"Warning: Could not auto-calculate Z-Score: {e}")
     
     ruas_jalan_list = RuasJalan.objects.all().distinct()
     threshold_data = {}
@@ -1224,16 +1252,19 @@ def api_threshold_data(request):
             t3 = z_min + (3 * interval)
             t4 = z_min + (4 * interval)
             
-            # Calculate mean and stddev
-            stats = RekapSegmen.objects.filter(
+            # Calculate mean and stddev using only RekapSegmen for this ruas
+            rekap_stats_qs = RekapSegmen.objects.filter(
                 periode_tahun=tahun,
                 segmen_jalan__in=segments_in_ruas
-            ).aggregate(
-                mean=Avg('jumlah_kecelakaan'),
-                stddev=StdDev('jumlah_kecelakaan')
-            )
-            mean = float(stats['mean'] or 0.0)
-            stddev = float(stats['stddev'] or 0.0)
+            ).values_list('jumlah_kecelakaan', flat=True)
+            values = [float(x) for x in rekap_stats_qs if x is not None]
+            mean = round(sum(values) / len(values), 3) if values else 0.0
+            if values:
+                import math
+                variance = sum((x - mean) ** 2 for x in values) / len(values)
+                stddev = round(math.sqrt(variance), 3)
+            else:
+                stddev = 0.0
 
             # Count segments per kategori
             kategori_counts = {
@@ -1330,6 +1361,77 @@ def api_kecelakaan_geojson(request):
     }
     
     return Response(geojson)
+
+
+@api_view(['GET'])
+def api_kecelakaan_preprosesing(request):
+    """API Read-only untuk data KecelakaanPreprosesing tanpa autentikasi."""
+    kecelakaan_list = KecelakaanPreprosesing.objects.all()
+
+    # Jika tidak ada data, tampilkan array kosong dengan count 0
+    if not kecelakaan_list.exists():
+        return Response({
+            'status': 'success',
+            'count': 0,
+            'data': []
+        })
+
+    serializer = KecelakaanPreprosesingSerializer(kecelakaan_list, many=True)
+    return Response({
+        'status': 'success',
+        'count': kecelakaan_list.count(),
+        'data': serializer.data
+    })
+
+
+@api_view(['GET'])
+def api_ahc_preprosesing(request):
+    """API read-only untuk data preprocessing AHC tanpa authentication."""
+    ahc_list = AhcPreprosesing.objects.all()
+    serializer = AhcPreprosesingSerializer(ahc_list, many=True)
+
+    # Data kosong tetap dikembalikan sebagai response JSON yang konsisten.
+    return Response({
+        'status': 'success',
+        'count': ahc_list.count(),
+        'data': serializer.data,
+    })
+
+
+@api_view(['GET'])
+def api_kmeans_preprosesing(request):
+    """API read-only untuk data preprocessing K-Means tanpa authentication."""
+    kmeans_list = KmeansPreprosesing.objects.all()
+    serializer = KmeansPreprosesingSerializer(kmeans_list, many=True)
+
+    # Data kosong tetap dikembalikan sebagai response JSON yang konsisten.
+    return Response({
+        'status': 'success',
+        'count': kmeans_list.count(),
+        'data': serializer.data,
+    })
+
+
+@superadmin_required
+def api_data_page(request, api_name):
+    """Halaman ringkasan API dengan layout sistem, khusus superadmin."""
+    api_config = {
+        'kecelakaan': ('Z-Score API', KecelakaanPreprosesing, 'api_kecelakaan_preprosesing'),
+        'ahc': ('AHC API', AhcPreprosesing, 'api_ahc_preprosesing'),
+        'kmeans': ('Kmeans API', KmeansPreprosesing, 'api_kmeans_preprosesing'),
+    }
+    config = api_config.get(api_name)
+    if config is None:
+        raise Http404('API tidak ditemukan')
+
+    label, model, endpoint_name = config
+    return render(request, 'coreapp/api_data.html', {
+        'api_label': label,
+        'api_status': 'success',
+        'api_count': model.objects.count(),
+        'api_columns': [field.name for field in model._meta.fields],
+        'api_endpoint': request.build_absolute_uri(reverse_lazy(endpoint_name)),
+    })
 
 
 @api_view(['GET'])
@@ -2328,7 +2430,18 @@ def kecelakaan_raw_list(request):
 @login_required(login_url='login')
 @user_passes_test(is_admin)
 def upload_kecelakaan_preprosesing(request):
-    """Upload data kecelakaan preprocessing dari Excel/CSV"""
+    """Upload data kecelakaan preprocessing dari Excel/CSV
+    
+    Proses:
+    1. Baca file Excel/CSV
+    2. Validasi kolom yang diperlukan
+    3. Simpan setiap baris ke database (tanpa menghitung rekap/zscore per row)
+    4. Setelah semua data berhasil disimpan, hitung RekapSegmen dan AnalisisZScore
+       untuk setiap tahun yang ada di data yang diupload
+    
+    Ini meningkatkan performa ketika upload data masif karena perhitungan hanya
+    dilakukan sekali setelah seluruh data disimpan, bukan per row.
+    """
     if request.method == 'POST':
         form = UploadKecelakaanPreprosesForm(request.POST, request.FILES)
         if form.is_valid():
@@ -2354,9 +2467,11 @@ def upload_kecelakaan_preprosesing(request):
                 # Check apakah nomor_kecelakaan ada (opsional)
                 has_nomor = 'nomor_kecelakaan' in df.columns
                 
-                # Import data
+                # Import data - Track tahun-tahun yang ada di data yang diupload
                 count = 0
                 errors = []
+                tahun_set = set()  # Track tahun-tahun unik
+                
                 for idx, row in df.iterrows():
                     try:
                         # Parse waktu - handle berbagai format
@@ -2379,9 +2494,14 @@ def upload_kecelakaan_preprosesing(request):
                                 except:
                                     raise ValueError(f"Kolom waktu berisi tanggal bukan jam. Gunakan format HH:MM:SS")
                         
+                        # Parse tanggal dan track tahunnya
+                        tanggal_obj = pd.to_datetime(row['tanggal'])
+                        tahun = tanggal_obj.year
+                        tahun_set.add(tahun)
+                        
                         # Build create dict with nomor_kecelakaan jika available
                         create_data = {
-                            'tanggal': pd.to_datetime(row['tanggal']),
+                            'tanggal': tanggal_obj,
                             'waktu': waktu_obj,
                             'latitude': float(row['latitude']),
                             'longitude': float(row['longitude']),
@@ -2405,10 +2525,58 @@ def upload_kecelakaan_preprosesing(request):
                     except Exception as e:
                         errors.append(f"Baris {idx + 2}: {str(e)}")
                 
+                # ============================================================
+                # SETELAH SEMUA DATA DISIMPAN, LAKUKAN PERHITUNGAN REKAP & ZSCORE
+                # ============================================================
+                if count > 0 and tahun_set:
+                    print(f"\n{'='*80}")
+                    print(f"📊 Starting batch calculations after importing {count} records...")
+                    print(f"{'='*80}")
+                    
+                    calc_failed = False
+                    calc_errors = {}
+                    
+                    try:
+                        # Hitung RekapSegmen dan AnalisisZScore untuk setiap tahun yang ada
+                        for tahun in sorted(tahun_set):
+                            try:
+                                print(f"\n🔄 Processing tahun {tahun}...")
+                                print(f"   Step 1: Updating RekapSegmen for tahun {tahun}...")
+                                RekapSegmen.update_rekap(tahun)
+                                
+                                print(f"   Step 2: Calculating AnalisisZScore for tahun {tahun}...")
+                                AnalisisZScore.calculate_zscore(tahun)
+                                print(f"   ✅ Completed for tahun {tahun}")
+                            except Exception as tahun_error:
+                                calc_failed = True
+                                calc_errors[tahun] = str(tahun_error)
+                                print(f"   ❌ Error for tahun {tahun}: {str(tahun_error)}")
+                                import traceback
+                                print(traceback.format_exc())
+                        
+                        print(f"\n{'='*80}")
+                        if calc_failed:
+                            print(f"⚠️ Some calculations failed (see above for details)")
+                            messages.warning(request, 
+                                f'Data berhasil diimport ({count} records), namun ada error pada perhitungan untuk tahun: {", ".join(map(str, calc_errors.keys()))}. Detail error ada di console.')
+                        else:
+                            print(f"✅ All calculations completed successfully!")
+                            messages.success(request, f'✅ Berhasil import dan process {count} data kecelakaan preprocessing.')
+                        print(f"{'='*80}\n")
+                    except Exception as calc_error:
+                        print(f"\n❌ CRITICAL Error during calculations: {str(calc_error)}")
+                        import traceback
+                        print(traceback.format_exc())
+                        messages.error(request, 
+                            f'Data berhasil diimport ({count} records), tapi ERROR CRITICAL saat perhitungan: {str(calc_error)}. Lihat console untuk detail lengkap.')
+                
                 if errors and len(errors) <= 10:
                     messages.warning(request, f'Berhasil import {count} data, tapi ada beberapa error:\n' + '\n'.join(errors[:5]))
-                else:
-                    messages.success(request, f'Berhasil import {count} data kecelakaan preprocessing.')
+                elif not calc_failed and not errors:
+                    if count == 0:
+                        messages.info(request, 'Tidak ada data baru yang diimport.')
+                    else:
+                        messages.success(request, f'Berhasil import {count} data kecelakaan preprocessing.')
                 
                 return redirect('kecelakaan_preprosesing_list')
             except Exception as e:

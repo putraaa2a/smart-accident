@@ -21,12 +21,12 @@
     </div>
 
     <!-- FILE AKTIF -->
-    {% if request.session.uploaded_file_name %}
+    {% if request.session.kmeans_uploaded_file_name %}
     <div class="bg-green-50 border border-green-200 rounded-xl p-4 mb-6 flex justify-between items-center">
         <div>
             <p class="text-sm text-gray-500">File Aktif</p>
             <p class="font-semibold text-green-700">
-                {{ request.session.uploaded_file_name }}
+                {{ request.session.kmeans_uploaded_file_name }}
             </p>
         </div>
 

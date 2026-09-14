@@ -10,7 +10,50 @@ from django.contrib.auth.decorators import login_required
 from django.contrib import messages
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
-from .models import AIConfig, ClusterData
+from .models import AIConfig, KmeansPreprosesing
+
+
+def _save_uploaded_kmeans_data(df):
+    """Simpan baris file upload K-Means ke tabel khusus sebelum transformasi."""
+    from decimal import Decimal, InvalidOperation
+    from .models import KmeansPreprosesing
+
+    # Normalisasi nama kolom file agar sesuai dengan field tabel.
+    normalized = {str(column).strip().lower(): column for column in df.columns}
+
+    def value(row, name, default=''):
+        source = normalized.get(name.lower())
+        result = row[source] if source is not None else default
+        return default if pd.isna(result) else result
+
+    def to_date(raw_value):
+        parsed = pd.to_datetime(raw_value, errors='coerce')
+        return None if pd.isna(parsed) else parsed.date()
+
+    def to_decimal(raw_value):
+        try:
+            digits = ''.join(character for character in str(raw_value) if character.isdigit() or character in '.-')
+            return Decimal(digits or '0')
+        except (InvalidOperation, ValueError):
+            return Decimal('0')
+
+    records = []
+    for _, row in df.iterrows():
+        age = pd.to_numeric(value(row, 'umur', 0), errors='coerce')
+        records.append(KmeansPreprosesing(
+            no_referensi=str(value(row, 'no')).strip() or None,
+            umur=0 if pd.isna(age) else int(age),
+            tkp=str(value(row, 'tkp')).strip(),
+            penyebab=str(value(row, 'penyebab')).strip(),
+            hari=str(value(row, 'hari')).strip(),
+            tanggal=to_date(value(row, 'tanggal', None)),
+            jam=str(value(row, 'jam')).strip(),
+            jenis_kendaraan=str(value(row, 'jenis kendaraan')).strip(),
+            tipe_kendaraan=str(value(row, 'tipe kendaraan')).strip(),
+            kerugian_material=to_decimal(value(row, 'kerugian material', 0)),
+        ))
+    if records:
+        KmeansPreprosesing.objects.bulk_create(records, batch_size=1000)
 
 # ================================
 # PREPROCESSING DATA K-MEANS HELPERS
@@ -194,12 +237,12 @@ def preprocessing(request):
     if request.method == "POST" or use_db:
         # Reset session
         for key in ['hasil_cluster', 'summary_cluster', 'jumlah_cluster', 'jumlah_data',
-                    'silhouette_score', 'X_scaled', 'summary_df', 'jumlah_data_asli',
-                    'ai_dashboard_analysis', 'ai_recommendation_data']:
-            request.session.pop(key, None)
+                'silhouette_score', 'X_scaled', 'summary_df', 'jumlah_data_asli',
+                'ai_dashboard_analysis', 'ai_recommendation_data']:
+            request.session.pop(f'kmeans_{key}', None)
 
         if use_db:
-            data_db = ClusterData.objects.all().values()
+            data_db = KmeansPreprosesing.objects.all().values()
             if not data_db:
                 messages.error(request, "Data di database masih kosong.")
                 return redirect('cluster_data_list')
@@ -211,20 +254,21 @@ def preprocessing(request):
                 'jenis_kendaraan': 'Jenis Kendaraan', 'tipe_kendaraan': 'Tipe Kendaraan',
                 'kerugian_material': 'Kerugian Material'
             })
-            request.session['uploaded_file_name'] = "Database"
+            request.session['kmeans_uploaded_file_name'] = "Database K-Means"
         else:
             file = request.FILES.get('file')
             if file:
                 df = pd.read_excel(file)
-                request.session['uploaded_file_name'] = file.name
+                request.session['kmeans_uploaded_file_name'] = file.name
+                _save_uploaded_kmeans_data(df)
 
         if df is not None:
-            request.session['jumlah_data_asli'] = len(df)
+            request.session['kmeans_jumlah_data_asli'] = len(df)
             summary_df = _perform_kmeans_preprocessing(df)
             
             # Simpan ke session
-            request.session['summary_df'] = summary_df.to_dict(orient='records')
-            request.session['jumlah_data_bersih'] = len(summary_df)
+            request.session['kmeans_summary_df'] = summary_df.to_dict(orient='records')
+            request.session['kmeans_jumlah_data_bersih'] = len(summary_df)
             request.session.modified = True
 
             preview_df = summary_df.head(10) if not show_all else summary_df
@@ -236,7 +280,7 @@ def preprocessing(request):
     # ─────────────────────────────────────────────────────
     # 2️⃣ LOAD DARI SESSION (GET request / kembali ke halaman)
     # ─────────────────────────────────────────────────────
-    summary_json = request.session.get('summary_df')
+    summary_json = request.session.get('kmeans_summary_df')
     if summary_json:
         if isinstance(summary_json, list):
             df = pd.DataFrame(summary_json)
@@ -251,8 +295,8 @@ def preprocessing(request):
         context['jumlah_data_bersih'] = len(df)
 
     # Tampilkan hasil cluster dari session (jika sudah pernah proses)
-    hasil_cluster_session = request.session.get('hasil_cluster')
-    k_session             = request.session.get('k')
+    hasil_cluster_session = request.session.get('kmeans_hasil_cluster')
+    k_session             = request.session.get('kmeans_k')
     show_all_hasil        = request.GET.get('show_all_hasil') == '1'
 
     if hasil_cluster_session and k_session:
@@ -272,7 +316,7 @@ def reset_k_means(request):
             'silhouette_score', 'X_scaled', 'summary_df', 'uploaded_file_name', 
             'jumlah_data_asli', 'ai_dashboard_analysis', 'ai_recommendation_data']
     for key in keys:
-        request.session.pop(key, None)
+        request.session.pop(f'kmeans_{key}', None)
     return redirect('preprocessing')
 
 
@@ -290,7 +334,7 @@ def proses_cluster(request):
         k = 3
     k = max(2, min(k, 3))
 
-    summary_json = request.session.get('summary_df')
+    summary_json = request.session.get('kmeans_summary_df')
     if not summary_json:
         return redirect('preprocessing')
 
@@ -330,7 +374,7 @@ def proses_cluster(request):
             km_temp = KMeans(n_clusters=i, random_state=42, n_init=10)
             km_temp.fit(X_scaled)
             elbow_data.append(float(km_temp.inertia_))
-        request.session['elbow_data'] = elbow_data
+        request.session['kmeans_elbow_data'] = elbow_data
 
         model = KMeans(n_clusters=k, random_state=42, n_init=10)
         df['Cluster'] = model.fit_predict(X_scaled) + 1  # 1,2,3
@@ -365,15 +409,15 @@ def proses_cluster(request):
     display_cols = [c for c in df.columns if c not in ['Hari_Numerik', 'Jam_Numerik', 'Jumlah_Kejadian', 'Cluster', 'Kategori']]
     df_display = df[display_cols + ['Kategori', 'Cluster']]
 
-    request.session['hasil_cluster'] = full_df_dict
-    request.session['hasil_cluster_display'] = df_display.to_dict(orient='records')
-    request.session['k'] = k
+    request.session['kmeans_hasil_cluster'] = full_df_dict
+    request.session['kmeans_hasil_cluster_display'] = df_display.to_dict(orient='records')
+    request.session['kmeans_k'] = k
     request.session.modified = True
 
     show_all       = request.GET.get('show_all') == '1'
     show_all_hasil = request.GET.get('show_all_hasil') == '1'
 
-    summary_json = request.session.get('summary_df')
+    summary_json = request.session.get('kmeans_summary_df')
     preview_df   = pd.DataFrame()
     if summary_json:
         try:
@@ -382,7 +426,7 @@ def proses_cluster(request):
         except Exception:
             preview_df = pd.DataFrame()
 
-    hasil_list = request.session.get('hasil_cluster_display', df_display.to_dict(orient='records'))
+    hasil_list = request.session.get('kmeans_hasil_cluster_display', df_display.to_dict(orient='records'))
 
     return render(request, 'coreapp/k-means/preprocessing.html', {
         'preview'            : (preview_df.to_dict(orient='records') if show_all
@@ -390,7 +434,7 @@ def proses_cluster(request):
                                if not preview_df.empty else [],
         'is_full_preview'    : show_all,
         'jumlah_data_bersih' : len(preview_df) if not preview_df.empty else len(df),
-        'jumlah_data_awal'   : request.session.get('jumlah_data_asli'),
+        'jumlah_data_awal'   : request.session.get('kmeans_jumlah_data_asli'),
         'hasil_cluster'      : hasil_list if show_all_hasil else hasil_list[:10],
         'is_full_hasil'      : show_all_hasil,
         'k'                  : k,
@@ -402,7 +446,7 @@ def proses_cluster(request):
 # ==========================================
 @login_required(login_url='login')
 def hasil(request):
-    data = request.session.get("hasil_cluster")
+    data = request.session.get("kmeans_hasil_cluster")
 
     if not data:
         return render(request, "coreapp/k-means/hasil.html", {"belum_clustering": True})
@@ -440,7 +484,7 @@ def hasil(request):
                 'jumlah'   : int(jumlah),
             })
 
-    jumlah_data_awal   = request.session.get('jumlah_data_asli')
+    jumlah_data_awal   = request.session.get('kmeans_jumlah_data_asli')
     jumlah_data_bersih = len(df)
 
     hasil_cluster_list = df.to_dict(orient='records')
@@ -461,7 +505,7 @@ def hasil(request):
         "y_col_name":         "Hari (1=Senin...7=Minggu)",
         "jumlah_data_awal":    jumlah_data_awal,
         "jumlah_data_bersih":  jumlah_data_bersih,
-        "elbow_data_json":     json.dumps(request.session.get('elbow_data', [])),
+        "elbow_data_json":     json.dumps(request.session.get('kmeans_elbow_data', [])),
     }
 
     return render(request, "coreapp/k-means/hasil.html", context)
@@ -472,11 +516,11 @@ def hasil(request):
 # ==========================================
 @login_required(login_url='login')
 def rekomendasi_kebijakan(request):
-    data = request.session.get("hasil_cluster")
+    data = request.session.get("kmeans_hasil_cluster")
     if not data:
         return render(request, "coreapp/k-means/rekomendasi.html", {"belum_clustering": True})
 
-    ai_data = request.session.get("ai_recommendation_data")
+    ai_data = request.session.get("kmeans_ai_recommendation_data")
     if not ai_data:
         return render(request, "coreapp/k-means/rekomendasi.html", {"belum_ai": True})
 
@@ -495,9 +539,9 @@ def rekomendasi_kebijakan(request):
         "pct_tinggi": pct_tinggi,
         "count_tinggi": count_tinggi,
         "count_sedang": count_sedang,
-        "k": request.session.get('k', 3),
+        "k": request.session.get('kmeans_k', 3),
         "today": pd.Timestamp.now().strftime('%d %B %Y'),
-        "ai_data": request.session.get('ai_recommendation_data')
+        "ai_data": request.session.get('kmeans_ai_recommendation_data')
     }
     
     return render(request, "coreapp/k-means/rekomendasi.html", context)
@@ -511,7 +555,7 @@ def get_ai_recommendation(request):
     if request.method != "POST":
         return JsonResponse({"success": False, "message": "Method not allowed"}, status=405)
 
-    data = request.session.get("hasil_cluster")
+    data = request.session.get("kmeans_hasil_cluster")
     if not data:
         return JsonResponse({"success": False, "message": "Data cluster tidak ditemukan"}, status=400)
 
@@ -641,7 +685,7 @@ def get_ai_recommendation(request):
         except json.JSONDecodeError:
             return JsonResponse({"success": False, "message": "AI tidak mengembalikan format data yang valid."}, status=500)
 
-        request.session['ai_recommendation_data'] = ai_data
+        request.session['kmeans_ai_recommendation_data'] = ai_data
         request.session.modified = True
         return JsonResponse({"success": True, "data": ai_data})
     except requests.exceptions.Timeout:
@@ -658,11 +702,11 @@ def analyze_accident_clustering(request):
     if request.method != "POST":
         return JsonResponse({"success": False, "message": "Method not allowed"}, status=405)
 
-    cached_analysis = request.session.get('ai_dashboard_analysis')
+    cached_analysis = request.session.get('kmeans_ai_dashboard_analysis')
     if cached_analysis and request.POST.get('force') != '1':
         return JsonResponse({"success": True, "analysis": cached_analysis})
 
-    data = request.session.get("hasil_cluster")
+    data = request.session.get("kmeans_hasil_cluster")
     if not data:
         return JsonResponse({"success": False, "message": "Data cluster tidak ditemukan"}, status=400)
 
@@ -780,7 +824,7 @@ def analyze_accident_clustering(request):
         except json.JSONDecodeError:
             return JsonResponse({"success": False, "message": "AI tidak mengembalikan format analisis yang valid."}, status=500)
 
-        request.session['ai_dashboard_analysis'] = analysis_data
+        request.session['kmeans_ai_dashboard_analysis'] = analysis_data
         request.session.modified = True
 
         return JsonResponse({"success": True, "analysis": analysis_data})
