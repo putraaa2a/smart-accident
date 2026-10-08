@@ -691,38 +691,55 @@
     }
 
     function renderAiContent(data) {
+        const hasUsableContent = value => {
+            if (typeof value !== 'string') return false;
+            const normalized = value.replace(/<[^>]*>/g, '').replace(/\.{2,}/g, '').trim();
+            return normalized.length > 20;
+        };
+
+        const fallback = fallbackData;
+
         // PCA
         if(data.pca) {
             const p = document.getElementById('ai-pca-paragraphs');
             const b = document.getElementById('ai-pca-poin');
-            if(p) p.innerHTML = data.pca.paragraphs;
-            if(b) b.innerHTML = data.pca.poin_penting || "";
+            const paragraphs = hasUsableContent(data.pca.paragraphs) ? data.pca.paragraphs : fallback.pca.paragraphs;
+            const points = hasUsableContent(data.pca.poin_penting) ? data.pca.poin_penting : fallback.pca.poin_penting;
+            if(p) p.innerHTML = paragraphs;
+            if(b) b.innerHTML = points || "";
         }
         // Dendrogram
         if(data.dendrogram) {
             const p = document.getElementById('ai-dendro-paragraphs');
             const b = document.getElementById('ai-dendro-poin');
-            if(p) p.innerHTML = data.dendrogram.paragraphs;
-            if(b) b.innerHTML = data.dendrogram.hal_penting || "";
+            const paragraphs = hasUsableContent(data.dendrogram.paragraphs) ? data.dendrogram.paragraphs : fallback.dendrogram.paragraphs;
+            const points = hasUsableContent(data.dendrogram.hal_penting) ? data.dendrogram.hal_penting : fallback.dendrogram.hal_penting;
+            if(p) p.innerHTML = paragraphs;
+            if(b) b.innerHTML = points || "";
         }
         // Boxplot
         if(data.boxplot) {
             const c = document.getElementById('ai-boxplot-container');
-            if(c) c.innerHTML = data.boxplot.paragraphs || data.boxplot;
+            const content = data.boxplot.paragraphs || data.boxplot;
+            if(c) c.innerHTML = hasUsableContent(content) ? content : fallback.boxplot.paragraphs;
         }
         // Faktor
         if(data.faktor_global) {
             const p = document.getElementById('ai-faktor-paragraphs');
             const b = document.getElementById('ai-faktor-penutup');
-            if(p) p.innerHTML = data.faktor_global.paragraphs;
-            if(b) b.innerHTML = data.faktor_global.penutup || "";
+            const paragraphs = hasUsableContent(data.faktor_global.paragraphs) ? data.faktor_global.paragraphs : fallback.faktor_global.paragraphs;
+            const closing = hasUsableContent(data.faktor_global.penutup) ? data.faktor_global.penutup : fallback.faktor_global.penutup;
+            if(p) p.innerHTML = paragraphs;
+            if(b) b.innerHTML = closing || "";
         }
         // Umur
         if(data.umur_faktor) {
             const p = document.getElementById('ai-umur-paragraphs');
             const b = document.getElementById('ai-umur-kesimpulan');
-            if(p) p.innerHTML = data.umur_faktor.paragraphs;
-            if(b) b.innerHTML = data.umur_faktor.kesimpulan || "";
+            const paragraphs = hasUsableContent(data.umur_faktor.paragraphs) ? data.umur_faktor.paragraphs : fallback.umur_faktor.paragraphs;
+            const conclusion = hasUsableContent(data.umur_faktor.kesimpulan) ? data.umur_faktor.kesimpulan : fallback.umur_faktor.kesimpulan;
+            if(p) p.innerHTML = paragraphs;
+            if(b) b.innerHTML = conclusion || "";
         }
     }
 

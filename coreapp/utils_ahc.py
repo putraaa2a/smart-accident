@@ -12,6 +12,7 @@ from django.contrib.auth.decorators import login_required
 from django.contrib import messages
 from django.core.paginator import Paginator
 from .models import AIConfig, AhcPreprosesing
+from .ai_utils import parse_ai_json, request_ai_completion
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics import silhouette_score
@@ -512,7 +513,8 @@ def ahc_hasil(request):
     return render(request, 'coreapp/ahc/hasil.html', {
         "hasil_cluster": hasil_cluster, "summary_cluster": summary_cluster, "jumlah_cluster": jumlah_cluster, 
         "jumlah_data": jumlah_data, "total_kejadian": jumlah_data, "silhouette_score": silhouette,
-        "ahc_scatter_html": scatter_html, "ahc_dendrogram_html": dendrogram_html, "ahc_boxplot_html": boxplot_html, 
+        "ahc_scatter_html": scatter_html, "ahc_dendrogram_html": dendrogram_html, "ahc_boxplot_html": boxplot_html,
+        "scatter_html": scatter_html, "dendrogram_html": dendrogram_html, "boxplot_html": boxplot_html,
         "faktor_labels": faktor_labels, "faktor_values": faktor_values, "umur_labels": umur_labels,
         "cluster_labels": cluster_labels, "cluster_counts": cluster_counts, "cluster_detail": cluster_detail,
         "faktor_kelalaian": f_kelalaian, "faktor_pelanggaran": f_pelanggaran, "faktor_teknis": f_teknis, 
@@ -813,92 +815,8 @@ def ahc_ai_explain(request):
         """
 
         # Pakai API Key dari .env (Sesuai Permintaan User)
-        # Pakai AIConfig dari DB (Sesuai Struktur main)
-        config = AIConfig.objects.filter(tipe='ahc').first()
-        if not config:
-            config = AIConfig.objects.filter(tipe='kmeans').first()
-            
-        # Ambil API Key (Prioritas: Config DB > .env)
-        api_key_db = config.api_key.strip() if (config and config.api_key) else None
-        api_key_env = os.environ.get('GEMINI_API_KEY', '').strip()
-        
-        # Gunakan yang ada
-        api_key = api_key_db or api_key_env
-        
-        if not api_key:
-            return JsonResponse({"status": "error", "message": "API Key (Gemini) tidak ditemukan di database maupun .env"}, status=400)
-            
-        # Gunakan model Sesuai CURL dari USER
-        # Beberapa environment lebih stabil jika key dilewatkan via query param ?key=
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={api_key}"
-        headers = {
-            "Content-Type": "application/json",
-            "X-goog-api-key": api_key  # Tetap sertakan di header sesuai request user
-        }
-        
-        # DEBUGGING LENGKAP KE TERMINAL
-        print("\n" + "="*50)
-        print(" [AI REQUEST DEBUG] - AHC EXPLAIN")
-        print(f" URL: {url.split('?')[0]}")
-        print(f" Using Key: {api_key[:6]}...{api_key[-4:]} (Source: {'DB' if api_key_db else 'ENV'})")
-        print(f" Model: gemini-flash-latest")
-        print(f" Payload Size: {len(json.dumps(payload, cls=NpEncoder))} bytes")
-        print("-" * 50)
-
-        import time
-        start_time = time.time()
-        
         try:
-            resp = requests.post(
-                url,
-                headers=headers,
-                json={"contents": [{"parts": [{"text": full_prompt}]}]},
-                timeout=60 
-            )
-            
-            end_time = time.time()
-            print(f" Status Code: {resp.status_code}")
-            print(f" Time Taken: {round(end_time - start_time, 2)}s")
-            
-            res_json = resp.json()
-            
-            if resp.status_code != 200:
-                print(f" ERROR RESPONSE: {json.dumps(res_json, indent=2)}")
-            else:
-                print(" RESPONSE: Success (JSON Received)")
-                # Print preview text
-                if "candidates" in res_json and res_json["candidates"]:
-                    text_preview = res_json["candidates"][0]["content"]["parts"][0]["text"][:100]
-                    print(f" Text Preview: {text_preview}...")
-
-            print("="*50 + "\n")
-
-        except requests.exceptions.Timeout:
-            print(" [ERROR] Request Timeout (60s)")
-            return JsonResponse({"status": "error", "message": "AI Request Timeout. Silakan coba lagi."}, status=504)
-        except Exception as e:
-            print(f" [ERROR] Request Failed: {str(e)}")
-            raise e
-
-        # Validasi: Cek apakah ada candidates
-        if "candidates" not in res_json or not res_json["candidates"]:
-            error_msg = "Gemini tidak memberikan jawaban (Mungkin karena kebijakan keamanan atau limit)."
-            if "error" in res_json:
-                error_msg = res_json["error"].get("message", error_msg)
-            elif "promptFeedback" in res_json:
-                error_msg = f"Konten ditolak oleh AI (Safety Filter). Detail: {res_json['promptFeedback']}"
-            return JsonResponse({"status": "error", "message": error_msg}, status=500)
-
-        try:
-            raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
-            
-            # Bersihkan jika ada markdown
-            if "```json" in raw_text:
-                raw_text = raw_text.split("```json")[1].split("```")[0].strip()
-            elif "```" in raw_text:
-                raw_text = raw_text.split("```")[1].split("```")[0].strip()
-                
-            parsed = json.loads(raw_text)
+            parsed = parse_ai_json(request_ai_completion(full_prompt, 'ahc', timeout=60))
             
             request.session['ahc_ai_explain_cache'] = parsed
             request.session.modified = True
@@ -913,6 +831,8 @@ def ahc_ai_explain(request):
                 "raw_response": raw_text[:500] if 'raw_text' in locals() else "No text"
             }, status=500)
 
+    except (ValueError, RuntimeError, requests.exceptions.Timeout) as e:
+        return JsonResponse({"status": "error", "message": str(e)}, status=504 if isinstance(e, requests.exceptions.Timeout) else 500)
     except Exception as e:
         import traceback
         error_trace = traceback.format_exc()
@@ -1000,54 +920,7 @@ def ahc_rekomendasi(request):
             }}
             """
 
-            # Pakai AIConfig dari DB (Sesuai Struktur main)
-            config = AIConfig.objects.filter(tipe='ahc').first()
-            if not config:
-                config = AIConfig.objects.filter(tipe='kmeans').first()
-                
-            # Ambil API Key (Prioritas: Config DB > .env)
-            api_key_db = config.api_key.strip() if (config and config.api_key) else None
-            api_key_env = os.environ.get('GEMINI_API_KEY', '').strip()
-            api_key = api_key_db or api_key_env
-            
-            if not api_key:
-                return JsonResponse({"success": False, "message": "API Key (Gemini) tidak ditemukan di database maupun .env"}, status=400)
-
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={api_key}"
-            headers = {
-                "Content-Type": "application/json",
-                "X-goog-api-key": api_key
-            }
-            
-            print("\n" + "="*50)
-            print(" [AI REQUEST DEBUG] - AHC REKOMENDASI")
-            print(f" Using Key: {api_key[:6]}...{api_key[-4:]} (Source: {'DB' if api_key_db else 'ENV'})")
-            print(f" URL: {url.split('?')[0]}")
-            print("-" * 50)
-
-            payload_api = {"contents": [{"parts": [{"text": prompt}]}]}
-            
-            import time
-            start_time = time.time()
-            
-            response = requests.post(url, headers=headers, json=payload_api, timeout=45)
-            
-            print(f" Status Code: {response.status_code}")
-            print(f" Time Taken: {round(time.time() - start_time, 2)}s")
-            
-            res_json = response.json()
-            if response.status_code != 200:
-                print(f" ERROR RESPONSE: {json.dumps(res_json, indent=2)}")
-            print("="*50 + "\n")
-
-            raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
-            
-            if "```json" in raw_text:
-                raw_text = raw_text.split("```json")[1].split("```")[0].strip()
-            elif "```" in raw_text:
-                raw_text = raw_text.split("```")[1].split("```")[0].strip()
-            
-            parsed = json.loads(raw_text)
+            parsed = parse_ai_json(request_ai_completion(prompt, 'ahc', timeout=45))
             request.session["ahc_ai_rekomendasi"] = parsed
             request.session.modified = True
             

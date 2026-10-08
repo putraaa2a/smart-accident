@@ -11,6 +11,7 @@ from django.contrib import messages
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from .models import AIConfig, KmeansPreprosesing
+from .ai_utils import parse_ai_json, request_ai_completion
 
 
 def _save_uploaded_kmeans_data(df):
@@ -573,25 +574,6 @@ def get_ai_recommendation(request):
         peak = tinggi_df.iloc[0]
         waktu_rawan = f"{peak['Hari']} pukul {peak['Jam']}"
 
-    config = AIConfig.objects.filter(tipe='kmeans').first()
-    api_key_db = config.api_key.strip() if (config and config.api_key) else None
-    api_key_env = os.environ.get('GEMINI_API_KEY', '').strip()
-    api_key = api_key_db or api_key_env
-
-    if not api_key:
-        return JsonResponse({"success": False, "message": "API Key belum dikonfigurasi."}, status=400)
-    
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={api_key}"
-    headers = {
-        "Content-Type": "application/json",
-        "X-goog-api-key": api_key
-    }
-    
-    print("\n" + "="*50)
-    print(" [AI REQUEST DEBUG] - KMEANS REKOMENDASI")
-    print(f" URL: {url.split('?')[0]}")
-    print(f" Using Key: {api_key[:6]}...{api_key[-4:]} (Source: {'DB' if api_key_db else 'ENV'})")
-
     class NpEncoder(json.JSONEncoder):
         def default(self, obj):
             if isinstance(obj, np.integer): return int(obj)
@@ -645,51 +627,16 @@ def get_ai_recommendation(request):
     - Tanpa penjelasan markdown di luar JSON.
     """
 
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    
-    print("\n" + "="*50)
-    print(" [AI REQUEST DEBUG] - KMEANS REKOMENDASI")
-    print(f" URL: {url.split('?')[0]}")
-    print(f" Using Key: {api_key[:6]}...{api_key[-4:]} (Source: {'DB' if api_key_db else 'ENV'})")
-    
-    import time
-    start_time = time.time()
-    
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
-        
-        print(f" Status Code: {response.status_code}")
-        print(f" Time Taken: {round(time.time() - start_time, 2)}s")
-        
-        res_json = response.json()
-        
-        if response.status_code != 200:
-            print(f" ERROR RESPONSE: {json.dumps(res_json, indent=2)}")
-        else:
-            print(" RESPONSE: Success")
-            
-        print("="*50 + "\n")
-        
-        if 'candidates' not in res_json or not res_json['candidates']:
-            error_msg = res_json.get('error', {}).get('message', 'Gemini API tidak mengembalikan hasil.')
-            http_code = response.status_code
-            friendly = "Server AI sedang sibuk atau overload. Silakan coba beberapa saat lagi." \
-                if http_code in (429, 503, 500, 502, 504) else f"AI Error: {error_msg}"
-            return JsonResponse({"success": False, "message": friendly}, status=200)
-
-        raw_text = res_json['candidates'][0]['content']['parts'][0]['text']
-        clean_text = raw_text.replace('```json', '').replace('```', '').strip()
-        
-        try:
-            ai_data = json.loads(clean_text)
-        except json.JSONDecodeError:
-            return JsonResponse({"success": False, "message": "AI tidak mengembalikan format data yang valid."}, status=500)
+        ai_data = parse_ai_json(request_ai_completion(prompt, 'kmeans', timeout=30))
 
         request.session['kmeans_ai_recommendation_data'] = ai_data
         request.session.modified = True
         return JsonResponse({"success": True, "data": ai_data})
     except requests.exceptions.Timeout:
-        return JsonResponse({"success": False, "message": "Koneksi ke AI (Gemini) timeout."}, status=504)
+        return JsonResponse({"success": False, "message": "Koneksi ke provider AI timeout."}, status=504)
+    except (ValueError, RuntimeError, json.JSONDecodeError) as e:
+        return JsonResponse({"success": False, "message": str(e)}, status=500)
     except Exception as e:
         return JsonResponse({"success": False, "message": f"System Error: {str(e)}"}, status=500)
 
@@ -770,66 +717,17 @@ def analyze_accident_clustering(request):
     - Tanpa saran/rekomendasi.
     """
 
-    config = AIConfig.objects.filter(tipe='kmeans').first()
-    api_key_db = config.api_key.strip() if (config and config.api_key) else None
-    api_key_env = os.environ.get('GEMINI_API_KEY', '').strip()
-    api_key = api_key_db or api_key_env
-
-    if not api_key:
-        return JsonResponse({"success": False, "message": "API Key belum dikonfigurasi."}, status=400)
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={api_key}"
-    headers = {
-        "Content-Type": "application/json",
-        "X-goog-api-key": api_key
-    }
-    
-    print("\n" + "="*50)
-    print(" [AI REQUEST DEBUG] - KMEANS ANALISIS")
-    print(f" URL: {url.split('?')[0]}")
-    print(f" Using Key: {api_key[:6]}...{api_key[-4:]} (Source: {'DB' if api_key_db else 'ENV'})")
-    print(f" Model: gemini-flash-latest")
-    
-    import time
-    start_time = time.time()
-    
     try:
-        payload = {"contents": [{"parts": [{"text": prompt}]}]}
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
-        
-        print(f" Status Code: {response.status_code}")
-        print(f" Time Taken: {round(time.time() - start_time, 2)}s")
-        
-        res_json = response.json()
-        
-        if response.status_code != 200:
-            print(f" ERROR RESPONSE: {json.dumps(res_json, indent=2)}")
-        else:
-            print(" RESPONSE: Success")
-
-        print("="*50 + "\n")
-        
-        if 'candidates' not in res_json or not res_json['candidates']:
-            error_msg = res_json.get('error', {}).get('message', 'Gemini API tidak mengembalikan hasil.')
-            http_code = response.status_code
-            friendly = "Server AI sedang sibuk atau overload. Silakan coba beberapa saat lagi." \
-                if http_code in (429, 503, 500, 502, 504) else f"AI Error: {error_msg}"
-            return JsonResponse({"success": False, "message": friendly}, status=200)
-            
-        raw_text = res_json['candidates'][0]['content']['parts'][0]['text']
-        clean_text = raw_text.replace('```json', '').replace('```', '').strip()
-        
-        try:
-            analysis_data = json.loads(clean_text)
-        except json.JSONDecodeError:
-            return JsonResponse({"success": False, "message": "AI tidak mengembalikan format analisis yang valid."}, status=500)
+        analysis_data = parse_ai_json(request_ai_completion(prompt, 'kmeans', timeout=30))
 
         request.session['kmeans_ai_dashboard_analysis'] = analysis_data
         request.session.modified = True
 
         return JsonResponse({"success": True, "analysis": analysis_data})
     except requests.exceptions.Timeout:
-        return JsonResponse({"success": False, "message": "Koneksi ke AI (Gemini) timeout."}, status=504)
+        return JsonResponse({"success": False, "message": "Koneksi ke provider AI timeout."}, status=504)
+    except (ValueError, RuntimeError, json.JSONDecodeError) as e:
+        return JsonResponse({"success": False, "message": str(e)}, status=500)
     except Exception as e:
         return JsonResponse({"success": False, "message": f"System Error: {str(e)}"}, status=500)
 
@@ -842,8 +740,12 @@ def save_ai_config(request):
     if request.method == "POST":
         tipe = request.POST.get('tipe', 'kmeans')
         api_key = request.POST.get('api_key')
+        provider = request.POST.get('provider', 'gemini')
+        if provider not in {'gemini', 'groq'}:
+            return JsonResponse({"success": False, "message": "Provider AI tidak valid."}, status=400)
         
         config, created = AIConfig.objects.get_or_create(tipe=tipe)
+        config.provider = provider
         config.api_key = api_key
         config.save()
         

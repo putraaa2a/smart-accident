@@ -289,8 +289,15 @@
                     <option value="ahc">AHC (Agglomerative Hierarchical Clustering)</option>
                 </select>
             </div>
+            <div class="mb-4">
+                <label class="block text-sm font-semibold text-gray-700 mb-2">Provider AI</label>
+                <select name="provider" id="providerSelect" class="w-full px-4 py-2 bg-gray-50 border rounded-lg text-gray-700 font-medium text-sm focus:ring-2 focus:ring-blue-500 transition" onchange="updateApiKeyInput()">
+                    <option value="gemini" {% if ai_config.provider|default:'gemini' == 'gemini' %}selected{% endif %}>Gemini</option>
+                    <option value="groq" {% if ai_config.provider == 'groq' %}selected{% endif %}>Groq</option>
+                </select>
+            </div>
             <div class="mb-6">
-                <label class="block text-sm font-semibold text-gray-700 mb-2">Gemini API Key</label>
+                <label class="block text-sm font-semibold text-gray-700 mb-2" id="apiKeyLabel">Gemini API Key</label>
                 <div class="relative">
                     <input type="password" name="api_key" id="apiKeyInput" value="{{ ai_config.api_key|default:'' }}" placeholder="Masukkan API Key..." 
                            class="w-full px-4 py-3 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500 transition font-mono">
@@ -404,10 +411,16 @@ const apiKeys = {
     'kmeans': '{{ ai_config.api_key|default:""|escapejs }}',
     'ahc': '{{ ai_config_ahc.api_key|default:""|escapejs }}'
 };
+const aiProviders = {
+    'kmeans': '{{ ai_config.provider|default:"gemini"|escapejs }}',
+    'ahc': '{{ ai_config_ahc.provider|default:"gemini"|escapejs }}'
+};
 
 function updateApiKeyInput() {
     const tipe = document.getElementById('tipeSelect').value;
-    document.getElementById('apiKeyInput').value = apiKeys[tipe] || '';
+    const provider = document.getElementById('providerSelect').value;
+    document.getElementById('apiKeyInput').value = aiProviders[tipe] === provider ? (apiKeys[tipe] || '') : '';
+    document.getElementById('apiKeyLabel').innerText = provider === 'groq' ? 'Groq API Key' : 'Gemini API Key';
 }
 
 function toggleApiKeyVisibility() {
@@ -443,7 +456,9 @@ document.getElementById('apiKeyForm').addEventListener('submit', function(e) {
             alert("API Key berhasil dikonfigurasi!");
             // Update local memory so we don't have to reload
             const tipe = document.getElementById('tipeSelect').value;
+            const provider = document.getElementById('providerSelect').value;
             apiKeys[tipe] = document.getElementById('apiKeyInput').value;
+            aiProviders[tipe] = provider;
             document.getElementById('apiKeyModal').classList.add('hidden');
         } else {
             alert("Error: " + data.message);
@@ -454,6 +469,12 @@ document.getElementById('apiKeyForm').addEventListener('submit', function(e) {
         btn.disabled = false;
         btn.innerHTML = originalText;
     });
+});
+
+document.getElementById('tipeSelect').addEventListener('change', function() {
+    const tipe = this.value;
+    document.getElementById('providerSelect').value = aiProviders[tipe] || 'gemini';
+    updateApiKeyInput();
 });
 
 let activeFormId = null;

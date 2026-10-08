@@ -1524,7 +1524,12 @@ class KmeansPreprosesing(models.Model):
 
 class AIConfig(models.Model):
     """Model untuk menyimpan konfigurasi API Key AI"""
+    PROVIDER_CHOICES = (
+        ('gemini', 'Gemini'),
+        ('groq', 'Groq'),
+    )
     tipe = models.CharField(max_length=50, unique=True, default='kmeans')
+    provider = models.CharField(max_length=20, choices=PROVIDER_CHOICES, default='gemini')
     api_key = models.CharField(max_length=255)
     updated_at = models.DateTimeField(auto_now=True)
 
